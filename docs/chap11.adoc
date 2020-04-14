@@ -1,0 +1,478 @@
+== Flink Table API & SQL
+
+=== 导入依赖
+
+根据使用的语言不同（Java，Scala），以下依赖选择一个使用。
+
+[source,xml]
+----
+<!-- Either... -->
+<dependency>
+  <groupId>org.apache.flink</groupId>
+  <artifactId>flink-table-api-java-bridge_2.11</artifactId>
+  <version>1.10.0</version>
+  <scope>provided</scope>
+</dependency>
+<!-- or... -->
+<dependency>
+  <groupId>org.apache.flink</groupId>
+  <artifactId>flink-table-api-scala-bridge_2.11</artifactId>
+  <version>1.10.0</version>
+  <scope>provided</scope>
+</dependency>
+----
+
+如果想兼容以前写的代码，可以使用下面的第一个依赖；如果想要使用阿里巴巴开发的一些新特性（TopN之类的），可以选择第二个依赖。
+
+[source,xml]
+----
+<!-- Either... (for the old planner that was available before Flink 1.9) -->
+<dependency>
+  <groupId>org.apache.flink</groupId>
+  <artifactId>flink-table-planner_2.11</artifactId>
+  <version>1.10.0</version>
+  <scope>provided</scope>
+</dependency>
+<!-- or.. (for the new Blink planner) -->
+<dependency>
+  <groupId>org.apache.flink</groupId>
+  <artifactId>flink-table-planner-blink_2.11</artifactId>
+  <version>1.10.0</version>
+  <scope>provided</scope>
+</dependency>
+----
+
+如果想要实现一些用户自定义函数（UDF），添加下面的依赖
+
+[source,xml]
+----
+<dependency>
+  <groupId>org.apache.flink</groupId>
+  <artifactId>flink-table-common</artifactId>
+  <version>1.10.0</version>
+  <scope>provided</scope>
+</dependency>
+----
+
+=== 使用Table API结合SQL实现TopN需求
+
+[source,scala]
+----
+package com.atguigu.project.topnhotitems
+
+import java.sql.Timestamp
+
+import com.atguigu.project.util.UserBehavior
+import org.apache.flink.streaming.api.TimeCharacteristic
+import org.apache.flink.streaming.api.scala.StreamExecutionEnvironment
+import org.apache.flink.api.scala._
+import org.apache.flink.table.api.{EnvironmentSettings, Tumble}
+import org.apache.flink.table.api.scala._
+
+object HotItemsTable {
+
+  def main(args: Array[String]): Unit = {
+
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    // 有关Blink的配置，样板代码
+    val settings = EnvironmentSettings.newInstance()
+      .useBlinkPlanner()
+      .inStreamingMode()
+      .build()
+    // 创建流式表的环境
+    val tEnv = StreamTableEnvironment.create(env, settings)
+    env.setParallelism(1)
+    // 使用事件时间
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime)
+    // 过滤出pv事件，并抽取时间戳
+    val stream = env
+      .readTextFile("/home/parallels/flink-tutorial/Flink0830Tutorial/src/main/resources/UserBehavior.csv")
+      .map(line => {
+        val arr = line.split(",")
+        UserBehavior(arr(0).toLong, arr(1).toLong, arr(2).toInt, arr(3), arr(4).toLong * 1000)
+      })
+      .filter(_.behavior == "pv")
+      .assignAscendingTimestamps(_.timestamp)
+
+    // 从流中提取两个字段，时间戳；itemId，组成一张表
+    val table = tEnv.fromDataStream(stream, 'timestamp.rowtime, 'itemId)
+    val t = table
+      .window(Tumble over 60.minutes on 'timestamp as 'w) // 一小时滚动窗口
+      .groupBy('itemId, 'w)                               // 根据itemId和窗口进行分组
+      .aggregate('itemId.count as 'icount)                // 对itemId进行计数
+      .select('itemId, 'icount, 'w.end as 'windowEnd)     // 查询三个字段
+      .toAppendStream[(Long, Long, Timestamp)]            // 转换成DataStream
+
+    // 创建临时表
+    tEnv.createTemporaryView("topn", t, 'itemId, 'icount, 'windowEnd)
+
+    // topN查询，Blink支持的特性
+    val result = tEnv.sqlQuery(
+      """
+        |SELECT *
+        |FROM (
+        |    SELECT *,
+        |        ROW_NUMBER() OVER (PARTITION BY windowEnd ORDER BY icount DESC) as row_num
+        |    FROM topn)
+        |WHERE row_num <= 5
+        |""".stripMargin
+    )
+    // 使用toRetractStream转换成DataStream，用来实时更新排行榜
+    // true代表insert, false代表delete
+    result.toRetractStream[(Long, Long, Timestamp, Long)].print()
+
+    env.execute()
+  }
+}
+----
+
+=== 只使用Flink SQL实现TopN需求
+
+代码
+
+[source,scala]
+----
+package com.atguigu.project.topnhotitems
+
+import java.sql.Timestamp
+
+import com.atguigu.project.util.UserBehavior
+import org.apache.flink.streaming.api.TimeCharacteristic
+import org.apache.flink.streaming.api.scala.StreamExecutionEnvironment
+import org.apache.flink.api.scala._
+import org.apache.flink.table.api.{EnvironmentSettings, Tumble}
+import org.apache.flink.table.api.scala._
+
+object HotItemsSQL {
+
+  def main(args: Array[String]): Unit = {
+
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    val settings = EnvironmentSettings.newInstance()
+      .useBlinkPlanner()
+      .inStreamingMode()
+      .build()
+    val tEnv = StreamTableEnvironment.create(env, settings)
+    env.setParallelism(1)
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime)
+    val stream = env
+      .readTextFile("/home/parallels/flink-tutorial/Flink0830Tutorial/src/main/resources/UserBehavior.csv")
+      .map(line => {
+        val arr = line.split(",")
+        UserBehavior(arr(0).toLong, arr(1).toLong, arr(2).toInt, arr(3), arr(4).toLong * 1000)
+      })
+      .filter(_.behavior == "pv")
+      .assignAscendingTimestamps(_.timestamp)
+
+    tEnv.createTemporaryView("t", stream, 'itemId, 'timestamp.rowtime as 'ts)
+
+    val result = tEnv.sqlQuery(
+      """
+        |SELECT *
+        |FROM (
+        |    SELECT *,
+        |        ROW_NUMBER() OVER (PARTITION BY windowEnd ORDER BY icount DESC) as row_num
+        |    FROM (SELECT count(itemId) as icount, TUMBLE_START(ts, INTERVAL '1' HOUR) as windowEnd FROM t GROUP BY TUMBLE(ts, INTERVAL '1' HOUR), itemId) topn)
+        |WHERE row_num <= 5
+        |""".stripMargin
+    )
+    result.toRetractStream[(Long, Timestamp, Long)].print()
+
+    env.execute()
+  }
+}
+----
+
+=== 用户自定义函数
+
+==== Scalar Functions
+
+例子
+
+[source,scala]
+----
+package com.atguigu.course
+
+import org.apache.flink.streaming.api.scala.StreamExecutionEnvironment
+import org.apache.flink.api.scala._
+import org.apache.flink.table.api.{EnvironmentSettings, Tumble}
+import org.apache.flink.table.api.scala._
+import org.apache.flink.table.functions.ScalarFunction
+
+object TableUDFExample1 {
+  def main(args: Array[String]): Unit = {
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    val settings = EnvironmentSettings.newInstance()
+      .useBlinkPlanner()
+      .inStreamingMode()
+      .build()
+    val tEnv = StreamTableEnvironment.create(env, settings)
+    env.setParallelism(1)
+    val stream = env.addSource(new SensorSource)
+    val hashCode = new HashCode(10)
+    tEnv.registerFunction("hashCode", new HashCode(10))
+    val table = tEnv.fromDataStream(stream, 'id)
+    // table api 写法
+    table
+      .select('id, hashCode('id))
+      .toAppendStream[(String, Int)]
+      .print()
+
+    // sql 写法
+    tEnv.createTemporaryView("t", table, 'id)
+    tEnv
+      .sqlQuery("SELECT id, hashCode(id) FROM t")
+      .toAppendStream[(String, Int)]
+      .print()
+
+    env.execute()
+  }
+
+  class HashCode(factor: Int) extends ScalarFunction {
+    def eval(s: String): Int = {
+      s.hashCode() * factor
+    }
+  }
+  
+}
+----
+
+==== Table Functions
+
+[source,scala]
+----
+package com.atguigu.course
+
+import org.apache.flink.streaming.api.scala.StreamExecutionEnvironment
+import org.apache.flink.api.scala._
+import org.apache.flink.table.api.{EnvironmentSettings, Tumble}
+import org.apache.flink.table.api.scala._
+import org.apache.flink.table.functions.TableFunction
+
+object TableUDFExample2 {
+  def main(args: Array[String]): Unit = {
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    val settings = EnvironmentSettings.newInstance()
+      .useBlinkPlanner()
+      .inStreamingMode()
+      .build()
+    val tEnv = StreamTableEnvironment.create(env, settings)
+    val split = new Split("#")
+    env.setParallelism(1)
+    val stream = env.fromElements(
+      "hello#world"
+    )
+    val table = tEnv.fromDataStream(stream, 's)
+    // table api 写法
+    table
+      .joinLateral(split('s) as ('word, 'length))
+      .select('s, 'word, 'length)
+      .toAppendStream[(String, String, Long)]
+      .print()
+    table
+      .leftOuterJoinLateral(split('s) as ('word, 'length))
+      .select('s, 'word, 'length)
+      .toAppendStream[(String, String, Long)]
+      .print()
+
+    // sql 写法
+    tEnv.registerFunction("split", new Split("#"))
+
+    tEnv.createTemporaryView("t", table, 's)
+
+    // Use the table function in SQL with LATERAL and TABLE keywords.
+    // CROSS JOIN a table function (equivalent to "join" in Table API)
+    tEnv
+      .sqlQuery("SELECT s, word, length FROM t, LATERAL TABLE(split(s)) as T(word, length)")
+      .toAppendStream[(String, String, Int)]
+      .print()
+    // LEFT JOIN a table function (equivalent to "leftOuterJoin" in Table API)
+    tEnv
+      .sqlQuery("SELECT s, word, length FROM t LEFT JOIN LATERAL TABLE(split(s)) as T(word, length) ON TRUE")
+      .toAppendStream[(String, String, Int)]
+      .print()
+
+    env.execute()
+
+  }
+  class Split(separator: String) extends TableFunction[(String, Int)] {
+    def eval(str: String): Unit = {
+      // use collect(...) to emit a row.
+      str.split(separator).foreach(x => collect((x, x.length)))
+    }
+  }
+}
+----
+
+==== Aggregation Functions
+
+例子
+
+[source,scala]
+----
+package com.atguigu.course
+
+import org.apache.flink.api.common.typeinfo.TypeInformation
+import org.apache.flink.api.java.typeutils.{RowTypeInfo, TupleTypeInfo}
+import org.apache.flink.streaming.api.scala.StreamExecutionEnvironment
+import org.apache.flink.api.scala._
+import org.apache.flink.table.api.{EnvironmentSettings, Tumble}
+import org.apache.flink.table.api.scala._
+import org.apache.flink.table.functions.AggregateFunction
+import org.apache.flink.table.api.Types
+import org.apache.flink.types.Row
+
+object TableUDFExample3 {
+  def main(args: Array[String]): Unit = {
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    val settings = EnvironmentSettings.newInstance()
+      .useBlinkPlanner()
+      .inStreamingMode()
+      .build()
+    val tEnv = StreamTableEnvironment.create(env, settings)
+    val myAggFunc = new MyMinMax
+    env.setParallelism(1)
+    val stream = env.fromElements(
+      (1, -1),
+      (1, 2)
+    )
+    val table = tEnv.fromDataStream(stream, 'key, 'a)
+    table
+      .groupBy('key)
+      .aggregate(myAggFunc('a) as ('x, 'y))
+      .select('key, 'x, 'y)
+      .toRetractStream[(Long, Long, Long)]
+      .print()
+    
+    env.execute()
+  }
+
+  case class MyMinMaxAcc(var min: Int, var max: Int)
+
+  class MyMinMax extends AggregateFunction[Row, MyMinMaxAcc] {
+
+    def accumulate(acc: MyMinMaxAcc, value: Int): Unit = {
+      if (value < acc.min) {
+        acc.min = value
+      }
+      if (value > acc.max) {
+        acc.max = value
+      }
+    }
+
+    override def createAccumulator(): MyMinMaxAcc = MyMinMaxAcc(0, 0)
+
+    def resetAccumulator(acc: MyMinMaxAcc): Unit = {
+      acc.min = 0
+      acc.max = 0
+    }
+
+    override def getValue(acc: MyMinMaxAcc): Row = {
+      Row.of(Integer.valueOf(acc.min), Integer.valueOf(acc.max))
+    }
+
+    override def getResultType: TypeInformation[Row] = {
+      new RowTypeInfo(Types.INT, Types.INT)
+    }
+  }
+}
+----
+
+==== Table Aggregation Functions
+
+例子
+
+[source,scala]
+----
+package com.atguigu.course
+
+import java.lang.{Integer => JInteger}
+
+import org.apache.flink.table.functions.TableAggregateFunction
+import org.apache.flink.api.scala._
+import org.apache.flink.streaming.api.scala.StreamExecutionEnvironment
+import org.apache.flink.table.api.EnvironmentSettings
+import org.apache.flink.table.api.scala._
+import org.apache.flink.api.java.tuple.{Tuple2 => JTuple2}
+import java.lang.{Iterable => JIterable}
+
+import org.apache.flink.util.Collector
+
+object TableUDFExample4 {
+  def main(args: Array[String]): Unit = {
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    val settings = EnvironmentSettings.newInstance()
+      .useBlinkPlanner()
+      .inStreamingMode()
+      .build()
+    val tEnv = StreamTableEnvironment.create(env, settings)
+    env.setParallelism(1)
+    val stream = env.fromElements(
+      (1, -1),
+      (1, 2),
+      (1, 0),
+      (1, 5),
+      (1, 4)
+    )
+    val top2 = new Top2
+    val table = tEnv.fromDataStream(stream, 'key, 'a)
+    table
+      .groupBy('key)
+      .flatAggregate(top2('a) as ('v, 'rank))
+      .select('key, 'v, 'rank)
+      .toRetractStream[(Long, Long, Long)]
+      .print()
+
+    env.execute()
+  }
+
+  /**
+   * Accumulator for top2.
+   */
+  class Top2Accum {
+    var first: JInteger = _
+    var second: JInteger = _
+  }
+
+  /**
+   * The top2 user-defined table aggregate function.
+   */
+  class Top2 extends TableAggregateFunction[JTuple2[JInteger, JInteger], Top2Accum] {
+
+    override def createAccumulator(): Top2Accum = {
+      val acc = new Top2Accum
+      acc.first = Int.MinValue
+      acc.second = Int.MinValue
+      acc
+    }
+
+    def accumulate(acc: Top2Accum, v: Int) {
+      if (v > acc.first) {
+        acc.second = acc.first
+        acc.first = v
+      } else if (v > acc.second) {
+        acc.second = v
+      }
+    }
+
+    def merge(acc: Top2Accum, its: JIterable[Top2Accum]): Unit = {
+      val iter = its.iterator()
+      while (iter.hasNext) {
+        val top2 = iter.next()
+        accumulate(acc, top2.first)
+        accumulate(acc, top2.second)
+      }
+    }
+
+    def emitValue(acc: Top2Accum, out: Collector[JTuple2[JInteger, JInteger]]): Unit = {
+      // emit the value and rank
+      if (acc.first != Int.MinValue) {
+        out.collect(JTuple2.of(acc.first, 1))
+      }
+      if (acc.second != Int.MinValue) {
+        out.collect(JTuple2.of(acc.second, 2))
+      }
+    }
+  }
+}
+----
